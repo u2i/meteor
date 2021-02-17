@@ -1,6 +1,8 @@
 // options.connection, if given, is a LivedataClient or LivedataServer
 // XXX presently there is no way to destroy/clean up a Collection
 
+import { ReplicationStore } from "./replication_store.js";
+
 /**
  * @summary Namespace for MongoDB-related items
  * @namespace
@@ -137,7 +139,8 @@ Mongo.Collection = function Collection(name, options) {
 
 Object.assign(Mongo.Collection.prototype, {
   _maybeSetUpReplication(name, {
-    _suppressSameNameError = false
+    _suppressSameNameError = false,
+    _replicationStoreFactory = (connector) => new ReplicationStore(connector)
   }) {
     const self = this;
     if (! (self._connection &&
@@ -148,116 +151,7 @@ Object.assign(Mongo.Collection.prototype, {
     // OK, we're going to be a slave, replicating some remote
     // database, except possibly with some temporary divergence while
     // we have unacknowledged RPC's.
-    const ok = self._connection.registerStore(name, {
-      // Called at the beginning of a batch of updates. batchSize is the number
-      // of update calls to expect.
-      //
-      // XXX This interface is pretty janky. reset probably ought to go back to
-      // being its own function, and callers shouldn't have to calculate
-      // batchSize. The optimization of not calling pause/remove should be
-      // delayed until later: the first call to update() should buffer its
-      // message, and then we can either directly apply it at endUpdate time if
-      // it was the only update, or do pauseObservers/apply/apply at the next
-      // update() if there's another one.
-      beginUpdate(batchSize, reset) {
-        // pause observers so users don't see flicker when updating several
-        // objects at once (including the post-reconnect reset-and-reapply
-        // stage), and so that a re-sorting of a query can take advantage of the
-        // full _diffQuery moved calculation instead of applying change one at a
-        // time.
-        if (batchSize > 1 || reset)
-          self._collection.pauseObservers();
-
-        if (reset)
-          self._collection.remove({});
-      },
-
-      // Apply an update.
-      // XXX better specify this interface (not in terms of a wire message)?
-      update(msg) {
-        var mongoId = MongoID.idParse(msg.id);
-        var doc = self._collection._docs.get(mongoId);
-
-        // Is this a "replace the whole doc" message coming from the quiescence
-        // of method writes to an object? (Note that 'undefined' is a valid
-        // value meaning "remove it".)
-        if (msg.msg === 'replace') {
-          var replace = msg.replace;
-          if (!replace) {
-            if (doc)
-              self._collection.remove(mongoId);
-          } else if (!doc) {
-            self._collection.insert(replace);
-          } else {
-            // XXX check that replace has no $ ops
-            self._collection.update(mongoId, replace);
-          }
-          return;
-        } else if (msg.msg === 'added') {
-          if (doc) {
-            throw new Error("Expected not to find a document already present for an add");
-          }
-          self._collection.insert({ _id: mongoId, ...msg.fields });
-        } else if (msg.msg === 'removed') {
-          if (!doc)
-            throw new Error("Expected to find a document already present for removed");
-          self._collection.remove(mongoId);
-        } else if (msg.msg === 'changed') {
-          if (!doc)
-            throw new Error("Expected to find a document to change");
-          const keys = Object.keys(msg.fields);
-          if (keys.length > 0) {
-            var modifier = {};
-            keys.forEach(key => {
-              const value = msg.fields[key];
-              if (EJSON.equals(doc[key], value)) {
-                return;
-              }
-              if (typeof value === "undefined") {
-                if (!modifier.$unset) {
-                  modifier.$unset = {};
-                }
-                modifier.$unset[key] = 1;
-              } else {
-                if (!modifier.$set) {
-                  modifier.$set = {};
-                }
-                modifier.$set[key] = value;
-              }
-            });
-            if (Object.keys(modifier).length > 0) {
-              self._collection.update(mongoId, modifier);
-            }
-          }
-        } else {
-          throw new Error("I don't know how to deal with this message");
-        }
-      },
-
-      // Called at the end of a batch of updates.
-      endUpdate() {
-        self._collection.resumeObservers();
-      },
-
-      // Called around method stub invocations to capture the original versions
-      // of modified documents.
-      saveOriginals() {
-        self._collection.saveOriginals();
-      },
-      retrieveOriginals() {
-        return self._collection.retrieveOriginals();
-      },
-
-      // Used to preserve current versions of documents across a store reset.
-      getDoc(id) {
-        return self.findOne(id);
-      },
-
-      // To be able to get back to the collection from the store.
-      _getCollection() {
-        return self;
-      }
-    });
+    const ok = self._connection.registerStore(name, _replicationStoreFactory(self));
 
     if (! ok) {
       const message = `There is already a collection named "${name}"`;
@@ -749,6 +643,12 @@ Mongo.ObjectID = MongoID.ObjectID;
  * @instanceName cursor
  */
 Mongo.Cursor = LocalCollection.Cursor;
+
+/**
+ * @summary Create store to replicate DDP messages from Meteor.
+ * @class
+ */
+Mongo.ReplicationStore = ReplicationStore;
 
 /**
  * @deprecated in 0.9.1
